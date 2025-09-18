@@ -106,3 +106,223 @@
 
         const v = sign * vRaw;
         const yTop = y(acc + v);
+        const yBot = y(acc);
+        const h = Math.max(0.5, yBot - yTop);
+
+        svg.appendChild(rect(x(i), yTop, barW, h, colorOf(pi)));
+        if (h > 14 && opts.show_data_labels) {
+          svg.appendChild(text(x(i)+barW/2, yTop+12, String(vRaw), 11, "#fff", "middle"));
+        }
+        acc += v;
+      });
+
+      svg.appendChild(text(x(i)+barW/2, H-padB+12, stageLabels[i], 11, "#444", "middle"));
+    });
+
+    svg.appendChild(text(padL, 16, "Stacked Waterfall (SVG fallback)", 13, "#333"));
+    host.innerHTML = "";
+    host.appendChild(svg);
+  }
+
+  // ---------- Looker viz ----------
+  looker.plugins.visualizations.add({
+    id: "stacked_waterfall_hybrid",
+    label: "Stacked Waterfall",
+    options: {
+      // Field resolution
+      stage_dim_name:      { type: "string", label: "Stage dimension name (defaults to first dim)", default: "" },
+      measure_name:        { type: "string", label: "Measure name (defaults to first measure)",    default: "" },
+      order_field_name:    { type: "string", label: "Optional sort field name (view.field)",        default: "" },
+
+      // Waterfall semantics
+      start_stage_label:   { type: "string", label: "Start stage label", default: "" },
+      negative_stages_csv: { type: "string", label: "Negative stages (CSV)", default: "" },
+      treat_after_start_as_negative: { type: "boolean", label: "Treat all stages after start as negative", default: true },
+
+      // Appearance
+      show_data_labels:    { type: "boolean", label: "Show data labels", default: true },
+      decimals:            { type: "number",  label: "Label decimals", default: 0 },
+      height_px:           { type: "number",  label: "Height (px)", default: 420 },
+      up_color:            { type: "string",  label: "Up color (Highcharts)", default: "#15af15" },
+      down_color:          { type: "string",  label: "Down color (Highcharts)", default: "#0088ff" },
+      connector_color:     { type: "string",  label: "Connector color (Highcharts)", default: "#999999" },
+      series_opacity:      { type: "number",  label: "Series opacity (0–1, Highcharts)", default: 0.9 },
+
+      // Vendor loading (so you can self-host Highcharts to avoid CSP)
+      vendor_base_url:     { type: "string", label: "Highcharts base URL (leave blank to try code.highcharts.com)", default: "" },
+
+      // Debug
+      debug_mode:          { type: "boolean", label: "Show debug panel", default: true }
+    },
+
+    create: function(element) {
+      this._root = document.createElement("div");
+      this._root.style.width = "100%";
+      this._root.style.height = "100%";
+      this._root.style.display = "flex";
+      this._root.style.flexDirection = "column";
+
+      this._alert = document.createElement("div");
+      this._alert.style.cssText = "font:12px system-ui;padding:8px 12px;display:none;background:#fff3cd;color:#7a5d00;border-bottom:1px solid #f1e2a6";
+      this._root.appendChild(this._alert);
+
+      this._viz = document.createElement("div");
+      this._viz.style.cssText = "flex:1 1 auto; width:100%; height:100%;";
+      this._root.appendChild(this._viz);
+
+      element.appendChild(this._root);
+    },
+
+    updateAsync: async function(data, element, config, queryResponse, details, done) {
+      const showDebug = !!config.debug_mode;
+      const alertBox = this._alert;
+      const host = this._viz;
+      function showWarn(msg) { alertBox.innerHTML = htmlEscape(msg); alertBox.style.display = "block"; }
+      function hideWarn() { alertBox.style.display = "none"; alertBox.innerHTML = ""; }
+
+      try {
+        hideWarn();
+
+        const dims = queryResponse.fields.dimensions || [];
+        const pivs = queryResponse.fields.pivots || [];
+        const meas = queryResponse.fields.measures || [];
+
+        // Debug panel (field counts)
+        if (showDebug) {
+          showWarn(`DEBUG ${now()} — dims=${dims.length}, pivots=${pivs.length}, measures=${meas.length}`);
+        }
+
+        // Validate query shape
+        if (!dims.length) {
+          host.innerHTML = "<div style='padding:12px;color:#a00'>Need a stage dimension (e.g., calls.call_funnel).</div>";
+          return done();
+        }
+        if (!pivs.length) {
+          host.innerHTML = "<div style='padding:12px;color:#a00'>Pivot by subcategory to stack breakdowns.</div>";
+          return done();
+        }
+        if (!meas.length) {
+          host.innerHTML = "<div style='padding:12px;color:#a00'>Need a measure (count or equivalent).</div>";
+          return done();
+        }
+
+        // Resolve field names
+        const stageDimName =
+          (config.stage_dim_name && dims.find(d => d.name === config.stage_dim_name)?.name) ||
+          dims[0].name;
+
+        const measureName =
+          (config.measure_name && meas.find(m => m.name === config.measure_name)?.name) ||
+          meas[0].name;
+
+        // Sort rows if order_field present
+        let rows = data.slice();
+        if (config.order_field_name) {
+          const key = config.order_field_name;
+          rows.sort((a,b) => {
+            const av = a[key]?.value, bv = b[key]?.value;
+            const an = Number(av), bn = Number(bv);
+            if (!Number.isNaN(an) && !Number.isNaN(bn)) return an - bn;
+            return String(av).localeCompare(String(bv));
+          });
+        }
+
+        // Try Highcharts first
+        const needHC = (typeof window.Highcharts === "undefined");
+        if (needHC) {
+          // Decide source
+          const base = (config.vendor_base_url || "").trim();
+          try {
+            if (base) {
+              await loadScript(base.replace(/\/+$/,"") + "/highcharts.js");
+              await loadScript(base.replace(/\/+$/,"") + "/modules/waterfall.js");
+            } else {
+              // Try the public CDN; if CSP blocks it, we'll fall back to SVG.
+              await loadScript("https://code.highcharts.com/highcharts.js");
+              await loadScript("https://code.highcharts.com/modules/waterfall.js");
+            }
+          } catch (e) {
+            // Could not load; we’ll fall back.
+          }
+        }
+
+        // If HC is present, render true stacked-waterfall
+        if (typeof window.Highcharts !== "undefined") {
+          try {
+            const categories = rows.map(r => String((r[stageDimName]?.value) ?? ""));
+            const negSet = new Set((config.negative_stages_csv||"").split(",").map(s=>s.trim()).filter(Boolean));
+            const startStage = (config.start_stage_label||"").trim();
+
+            const series = pivs.map(p => {
+              const pts = rows.map((r,i) => {
+                const cell = r[`${measureName}|${p.key}`];
+                const raw = (cell && cell.value!=null) ? +cell.value : 0;
+                const stage = String((r[stageDimName]?.value) ?? "");
+                let sign = 1;
+                if (negSet.size) sign = negSet.has(stage) ? -1 : 1;
+                else if (config.treat_after_start_as_negative && startStage) sign = (stage === startStage) ? 1 : -1;
+                else if (config.treat_after_start_as_negative && !startStage) sign = (i===0) ? 1 : -1;
+                const pt = { y: sign * raw };
+                if (startStage && stage === startStage) pt.isSum = true;
+                return pt;
+              });
+              return { type: "waterfall", name: p.label || p.key, data: pts, dataLabels: { enabled: !!config.show_data_labels } };
+            });
+
+            const HC = window.Highcharts;
+            const decimals = (typeof config.decimals === "number") ? config.decimals : 0;
+            const fmt = (v) => Number(v).toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+
+            HC.chart(host, {
+              chart: { type: "waterfall", height: config.height_px || 420 },
+              title: { text: "Stacked Waterfall" },
+              xAxis: { categories, tickmarkPlacement: "on" },
+              yAxis: { title: { text: (meas[0]?.label) || "Value" } },
+              tooltip: { shared: true, pointFormatter: function(){ return `<span style="color:${this.color}">●</span> ${this.series.name}: <b>${fmt(this.y)}</b><br/>`; } },
+              plotOptions: {
+                series: {
+                  stacking: "overlap", // key for stacked waterfall
+                  borderWidth: 0,
+                  opacity: (typeof config.series_opacity === "number") ? config.series_opacity : 0.9
+                },
+                waterfall: {
+                  upColor: config.up_color || "#15af15",
+                  color:   config.down_color || "#0088ff",
+                  lineColor: config.connector_color || "#999999",
+                  lineWidth: 1,
+                  dataLabels: { enabled: !!config.show_data_labels, formatter: function(){ return fmt(this.y); } }
+                }
+              },
+              series
+            });
+
+            // Success, hide warnings
+            if (showDebug) showWarn(`DEBUG ${now()} — Highcharts render OK`);
+            return done();
+          } catch (hcErr) {
+            // If HC rendering failed, report and fall through to fallback
+            showWarn(`Highcharts error: ${hcErr && hcErr.message ? hcErr.message : String(hcErr)} — falling back to SVG.`);
+          }
+        } else {
+          // No Highcharts globally available
+          showWarn("Highcharts not available (CSP or URL). Rendering SVG fallback.");
+        }
+
+        // SVG fallback
+        renderFauxWaterfall(host, rows, pivs, measureName, {
+          stage_dim_name: stageDimName,
+          start_stage_label: config.start_stage_label,
+          negative_stages_csv: config.negative_stages_csv,
+          treat_after_start_as_negative: !!config.treat_after_start_as_negative,
+          show_data_labels: !!config.show_data_labels,
+          height_px: config.height_px || 420
+        });
+
+        return done();
+      } catch (e) {
+        this._viz.innerHTML = `<div style="padding:12px;color:#a00">Viz error: ${htmlEscape(e && e.message ? e.message : String(e))}</div>`;
+        return done();
+      }
+    }
+  });
+})();
