@@ -1,295 +1,216 @@
 /**
- * Stacked Waterfall for Looker - Fixed Module Loading
+ * Stacked Waterfall (single-flight loader, self-host friendly, loud debug)
+ * Query shape: Rows = stage (e.g., calls.call_funnel), Pivot = subcategory (optional), Measure = count
  */
-
 (function() {
-  // Track loading state globally
-  window.waterfallModuleLoaded = window.waterfallModuleLoaded || false;
-  
+  // ---------- helpers ----------
+  function loadScriptOnce(src) {
+    if (!loadScriptOnce._map) loadScriptOnce._map = new Map();
+    if (loadScriptOnce._map.has(src)) return loadScriptOnce._map.get(src);
+    const p = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.async = true;
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error('Failed to load ' + src));
+      document.head.appendChild(s);
+    });
+    loadScriptOnce._map.set(src, p);
+    return p;
+  }
+  function now() { return new Date().toLocaleString(); }
+  function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+  // Global single-flight for Highcharts boot
+  let HC_BOOT = null;
+  async function ensureHighcharts(vendorBase, useCDNFallback) {
+    if (window.Highcharts && window.Highcharts.seriesTypes && window.Highcharts.seriesTypes.waterfall) {
+      return; // already loaded fully
+    }
+    if (!HC_BOOT) {
+      HC_BOOT = (async () => {
+        const base = (vendorBase || '').replace(/\/+$/, '');
+        const useBase = base || (useCDNFallback ? 'https://code.highcharts.com' : '');
+        if (!useBase) throw new Error('No vendor_base_url provided and CDN fallback disabled');
+
+        // load core then module
+        await loadScriptOnce(`${useBase}/highcharts.js`);
+        await loadScriptOnce(`${useBase}/modules/waterfall.js`);
+
+        if (!(window.Highcharts && window.Highcharts.seriesTypes && window.Highcharts.seriesTypes.waterfall)) {
+          throw new Error('Highcharts waterfall not available after load');
+        }
+      })();
+    }
+    return HC_BOOT;
+  }
+
   looker.plugins.visualizations.add({
-    id: "waterfall_fixed",
-    label: "Waterfall Chart (Fixed)",
-    
+    id: "stacked_waterfall_sf",
+    label: "Stacked Waterfall (SF)",
     options: {
-      chart_title: {
-        type: "string",
-        label: "Chart Title",
-        default: "Waterfall Analysis"
-      },
-      show_labels: {
-        type: "boolean",
-        label: "Show Data Labels",
-        default: true
-      },
-      height_px: {
-        type: "number",
-        label: "Height (px)",
-        default: 500
-      },
-      positive_color: {
-        type: "string",
-        label: "Positive Color",
-        default: "#52C41A"
-      },
-      negative_color: {
-        type: "string",
-        label: "Negative Color", 
-        default: "#1890FF"
-      }
+      // Data resolution
+      stage_dim_name:   { type: "string", label: "Stage dimension (defaults to first dim)", default: "" },
+      measure_name:     { type: "string", label: "Measure (defaults to first measure)", default: "" },
+      order_field_name: { type: "string", label: "Optional sort field (view.field)", default: "" },
+
+      // Semantics
+      start_stage_label:   { type: "string", label: "Start stage label", default: "" },
+      negative_stages_csv: { type: "string", label: "Negative stages (CSV)", default: "" },
+      treat_after_start_as_negative: { type: "boolean", label: "Treat all after start as negative", default: true },
+
+      // Appearance
+      chart_title:    { type: "string",  label: "Title", default: "Waterfall Analysis" },
+      show_labels:    { type: "boolean", label: "Show data labels", default: true },
+      height_px:      { type: "number",  label: "Height (px)", default: 500 },
+      positive_color: { type: "string",  label: "Positive color", default: "#52C41A" },
+      negative_color: { type: "string",  label: "Negative color", default: "#1890FF" },
+      connector_color:{ type: "string",  label: "Connector color", default: "#999" },
+
+      // Vendor loading
+      vendor_base_url:  { type: "string", label: "Vendor base URL (e.g., https://cdn.jsdelivr.net/gh/.../vendor)", default: "" },
+      allow_cdn_fallback: { type: "boolean", label: "Allow fallback to code.highcharts.com", default: false },
+
+      // Debug
+      debug_mode: { type: "boolean", label: "Show debug panel", default: true }
     },
 
-    create: function(element, config) {
+    create: function(element) {
+      // Shell
       element.innerHTML = `
-        <div id="waterfall-container" style="width:100%; height:100%; position:relative;">
-          <div id="loading-msg" style="padding:20px; text-align:center; color:#666;">
-            Initializing waterfall chart...
-          </div>
-          <div id="chart-area" style="width:100%; height:100%; display:none;"></div>
+        <div class="wf-root" style="display:flex;flex-direction:column;width:100%;height:100%;">
+          <div class="wf-alert" style="display:none;padding:8px 12px;font:12px system-ui;background:#fff3cd;color:#7a5d00;border-bottom:1px solid #f1e2a6"></div>
+          <div class="wf-host" style="flex:1 1 auto;width:100%;height:100%;"></div>
         </div>
       `;
-      
-      // Start loading libraries if needed
-      this.ensureLibrariesLoaded();
-    },
-    
-    ensureLibrariesLoaded: function() {
-      if (typeof window.Highcharts === 'undefined') {
-        console.log('[Waterfall] Loading Highcharts...');
-        
-        const script1 = document.createElement('script');
-        script1.src = 'https://code.highcharts.com/highcharts.js';
-        script1.onload = () => {
-          console.log('[Waterfall] Highcharts core loaded');
-          this.loadWaterfallModule();
-        };
-        script1.onerror = () => {
-          console.error('[Waterfall] Failed to load Highcharts');
-        };
-        document.head.appendChild(script1);
-      } else if (!window.waterfallModuleLoaded) {
-        console.log('[Waterfall] Highcharts found, loading waterfall module...');
-        this.loadWaterfallModule();
-      }
-    },
-    
-    loadWaterfallModule: function() {
-      // Check if waterfall is already available
-      if (window.Highcharts && window.Highcharts.seriesTypes && window.Highcharts.seriesTypes.waterfall) {
-        console.log('[Waterfall] Waterfall module already loaded');
-        window.waterfallModuleLoaded = true;
-        return;
-      }
-      
-      const script2 = document.createElement('script');
-      script2.src = 'https://code.highcharts.com/modules/waterfall.js';
-      script2.onload = () => {
-        console.log('[Waterfall] Waterfall module loaded');
-        window.waterfallModuleLoaded = true;
-      };
-      script2.onerror = () => {
-        console.error('[Waterfall] Failed to load waterfall module');
-      };
-      document.head.appendChild(script2);
+      this._alert = element.querySelector(".wf-alert");
+      this._host  = element.querySelector(".wf-host");
     },
 
-    updateAsync: function(data, element, config, queryResponse, details, done) {
-      console.log('[Waterfall] updateAsync called with', data.length, 'rows');
-      
-      const loadingMsg = document.getElementById('loading-msg');
-      const chartArea = document.getElementById('chart-area');
-      
-      // Validate data
-      const dims = queryResponse.fields.dimensions || [];
-      const pivots = queryResponse.fields.pivots || [];
-      const measures = queryResponse.fields.measures || [];
-      
-      if (dims.length === 0 || measures.length === 0) {
-        if (loadingMsg) {
-          loadingMsg.innerHTML = '<span style="color:red;">Missing required dimensions or measures</span>';
-        }
-        done();
-        return;
-      }
-      
-      // Wait for libraries with explicit check
-      let attempts = 0;
-      const maxAttempts = 20;
-      
-      const checkAndRender = () => {
-        const highchartsReady = typeof window.Highcharts !== 'undefined';
-        const waterfallReady = highchartsReady && 
-          window.Highcharts.seriesTypes && 
-          window.Highcharts.seriesTypes.waterfall;
-        
-        console.log('[Waterfall] Check attempt', attempts, 
-          '- Highcharts:', highchartsReady, 
-          '- Waterfall:', waterfallReady);
-        
-        if (waterfallReady) {
-          // Libraries ready, render the chart
-          if (loadingMsg) loadingMsg.style.display = 'none';
-          if (chartArea) chartArea.style.display = 'block';
-          
-          this.renderChart(data, chartArea, config, queryResponse);
-          done();
-        } else if (attempts < maxAttempts) {
-          // Keep trying
-          attempts++;
-          
-          if (loadingMsg) {
-            loadingMsg.innerHTML = `Loading chart libraries... (${attempts}/${maxAttempts})`;
-          }
-          
-          // Re-attempt loading if needed
-          if (!highchartsReady && attempts === 5) {
-            this.ensureLibrariesLoaded();
-          } else if (highchartsReady && !waterfallReady && attempts === 10) {
-            this.loadWaterfallModule();
-          }
-          
-          setTimeout(checkAndRender, 500);
-        } else {
-          // Give up and show error
-          if (loadingMsg) {
-            loadingMsg.innerHTML = `
-              <div style="color:red;">
-                <p>Failed to load chart libraries</p>
-                <p style="font-size:12px;">CSP may be blocking external scripts</p>
-                <p style="font-size:12px;">Highcharts: ${highchartsReady ? 'Loaded' : 'Failed'}</p>
-                <p style="font-size:12px;">Waterfall Module: ${waterfallReady ? 'Loaded' : 'Failed'}</p>
-              </div>
-            `;
-          }
-          done();
-        }
-      };
-      
-      checkAndRender();
-    },
-    
-    renderChart: function(data, container, config, queryResponse) {
-      console.log('[Waterfall] Starting chart render');
-      
+    updateAsync: async function(data, element, config, queryResponse, details, done) {
+      const host = this._host;
+      const alertBox = this._alert;
+      const showDebug = !!config.debug_mode;
+      const warn = (msg) => { alertBox.style.display = "block"; alertBox.innerHTML = esc(msg); };
+      const clearWarn = () => { alertBox.style.display = "none"; alertBox.innerHTML = ""; };
+
       try {
+        clearWarn();
         const dims = queryResponse.fields.dimensions || [];
-        const pivots = queryResponse.fields.pivots || [];
-        const measures = queryResponse.fields.measures || [];
-        
-        const stageDim = dims[0].name;
-        const measureName = measures[0].name;
-        
-        // Extract categories
-        const categories = data.map(row => {
-          return row[stageDim] ? String(row[stageDim].value) : 'Unknown';
-        });
-        
-        console.log('[Waterfall] Categories:', categories);
-        
-        let series = [];
-        
-        if (pivots.length > 0) {
-          // Stacked waterfall with pivots
-          console.log('[Waterfall] Creating stacked series for', pivots.length, 'pivots');
-          
-          series = pivots.map((pivot, pidx) => {
-            const seriesData = data.map((row, idx) => {
-              const fieldKey = measureName + '|' + pivot.key;
-              const cell = row[fieldKey];
-              const rawValue = cell && cell.value != null ? Number(cell.value) : 0;
-              
-              // First stage positive, rest negative for waterfall flow
-              const value = idx === 0 ? rawValue : -rawValue;
-              
-              return {
-                y: value,
-                color: value >= 0 ? config.positive_color : config.negative_color
-              };
+        const pivs = queryResponse.fields.pivots || [];
+        const meas = queryResponse.fields.measures || [];
+
+        if (showDebug) warn(`DEBUG ${now()} — dims=${dims.length}, pivots=${pivs.length}, measures=${meas.length}`);
+
+        if (!dims.length) { host.innerHTML = `<div style="padding:12px;color:#a00">Need a stage dimension.</div>`; return done(); }
+        if (!meas.length) { host.innerHTML = `<div style="padding:12px;color:#a00">Need a measure.</div>`; return done(); }
+
+        // Resolve fields
+        const stageDim =
+          (config.stage_dim_name && dims.find(d => d.name === config.stage_dim_name)?.name) ||
+          dims[0].name;
+
+        const measure =
+          (config.measure_name && meas.find(m => m.name === config.measure_name)?.name) ||
+          meas[0].name;
+
+        // Optional sort
+        let rows = data.slice();
+        if (config.order_field_name) {
+          const k = config.order_field_name;
+          rows.sort((a,b)=>{
+            const av=a[k]?.value, bv=b[k]?.value;
+            const an=Number(av), bn=Number(bv);
+            if (!Number.isNaN(an) && !Number.isNaN(bn)) return an-bn;
+            return String(av).localeCompare(String(bv));
+          });
+        }
+
+        // Prep categories and series
+        const categories = rows.map(r => String((r[stageDim]?.value) ?? "Unknown"));
+        const negSet = new Set((config.negative_stages_csv||"").split(",").map(s=>s.trim()).filter(Boolean));
+        const startStage = (config.start_stage_label||"").trim();
+
+        // Build Highcharts series (one per pivot if any, else single series)
+        let series;
+        if (pivs.length > 0) {
+          series = pivs.map(p => {
+            const dataPts = rows.map((r,i) => {
+              const cell = r[`${measure}|${p.key}`];
+              const raw = (cell && cell.value!=null) ? +cell.value : 0;
+
+              // sign: start positive, others negative; override via negative list
+              let sign = 1;
+              const stage = String((r[stageDim]?.value) ?? "");
+              if (negSet.size) sign = negSet.has(stage) ? -1 : 1;
+              else if (startStage) sign = (stage===startStage) ? 1 : -1;
+              else sign = (i===0) ? 1 : -1;
+
+              return { y: sign * raw };
             });
-            
-            return {
-              type: 'waterfall',
-              name: pivot.label || pivot.key,
-              data: seriesData
-            };
+            return { type: 'waterfall', name: p.label || p.key, data: dataPts };
           });
         } else {
-          // Single series waterfall
-          console.log('[Waterfall] Creating single series');
-          
-          const seriesData = data.map((row, idx) => {
-            const cell = row[measureName];
-            const rawValue = cell && cell.value != null ? Number(cell.value) : 0;
-            const value = idx === 0 ? rawValue : -rawValue;
-            
-            return {
-              y: value,
-              color: value >= 0 ? config.positive_color : config.negative_color
-            };
+          // Single-series waterfall
+          const dataPts = rows.map((r,i)=>{
+            const cell = r[measure];
+            const raw = (cell && cell.value!=null) ? +cell.value : 0;
+            let sign = (i===0) ? 1 : -1;
+            return { y: sign * raw };
           });
-          
-          series = [{
-            type: 'waterfall',
-            name: measures[0].label || 'Value',
-            data: seriesData
-          }];
+          series = [{ type: 'waterfall', name: (meas[0].label || 'Value'), data: dataPts }];
         }
-        
-        // Create unique container ID
-        const chartId = 'wf-chart-' + Date.now();
-        container.innerHTML = `<div id="${chartId}" style="width:100%; height:${config.height_px || 500}px;"></div>`;
-        
-        // Render with Highcharts
-        const chart = Highcharts.chart(chartId, {
-          chart: {
-            type: 'waterfall'
-          },
-          title: {
-            text: config.chart_title || 'Waterfall Chart'
-          },
-          xAxis: {
-            type: 'category',
-            categories: categories,
-            crosshair: true
-          },
-          yAxis: {
-            title: {
-              text: measures[0].label || 'Value'
-            }
-          },
+
+        // Load Highcharts once (self-host preferred)
+        try {
+          await ensureHighcharts(config.vendor_base_url, !!config.allow_cdn_fallback);
+        } catch (e) {
+          warn(`Highcharts load failed: ${e.message}. You likely need to self-host vendor files and set Vendor base URL.`);
+          host.innerHTML = `<div style="padding:12px">Could not load Highcharts. Try setting <b>Vendor base URL</b> to your repo (e.g., https://cdn.jsdelivr.net/gh/maxbickett/lookervis@main/vendor).</div>`;
+          return done();
+        }
+
+        const HC = window.Highcharts;
+        // container
+        const chartId = 'wf_' + Math.random().toString(36).slice(2);
+        host.innerHTML = `<div id="${chartId}" style="width:100%;height:${config.height_px||500}px"></div>`;
+
+        HC.chart(chartId, {
+          chart: { type: 'waterfall', height: config.height_px || 500 },
+          title: { text: config.chart_title || 'Waterfall' },
+          xAxis: { categories, type: 'category', crosshair: true },
+          yAxis: { title: { text: (meas[0]?.label) || 'Value' } },
           tooltip: {
             shared: true,
-            pointFormat: '<span style="color:{point.color}">●</span> {series.name}: <b>{point.y:,.0f}</b><br/>'
-          },
-          plotOptions: {
-            waterfall: {
-              stacking: pivots.length > 0 ? 'overlap' : undefined,
-              dataLabels: {
-                enabled: config.show_labels !== false,
-                formatter: function() {
-                  return Math.abs(this.y).toLocaleString();
-                }
-              },
-              lineWidth: 1,
-              lineColor: '#999',
-              dashStyle: 'Dot',
-              upColor: config.positive_color || '#52C41A',
-              color: config.negative_color || '#1890FF'
-            },
-            series: {
-              stacking: pivots.length > 0 ? 'overlap' : undefined
+            pointFormatter: function(){
+              const v = Math.abs(this.y).toLocaleString();
+              return `<span style="color:${this.color}">●</span> ${this.series.name}: <b>${v}</b><br/>`;
             }
           },
-          legend: {
-            enabled: pivots.length > 1
+          plotOptions: {
+            series: { stacking: (pivs.length>0 ? 'overlap' : undefined) },
+            waterfall: {
+              stacking: (pivs.length>0 ? 'overlap' : undefined),
+              dataLabels: {
+                enabled: config.show_labels !== false,
+                formatter: function(){ return Math.abs(this.y).toLocaleString(); }
+              },
+              lineWidth: 1,
+              lineColor: config.connector_color || '#999',
+              dashStyle: 'Dot',
+              upColor: config.positive_color || '#52C41A',
+              color:   config.negative_color || '#1890FF'
+            }
           },
-          series: series
+          legend: { enabled: pivs.length > 1 },
+          series
         });
-        
-        console.log('[Waterfall] Chart rendered successfully');
-        
-      } catch (error) {
-        console.error('[Waterfall] Render error:', error);
-        container.innerHTML = `<div style="padding:20px; color:red;">Chart render error: ${error.message}</div>`;
+
+        if (showDebug) warn(`DEBUG ${now()} — Highcharts render OK`);
+        return done();
+      } catch (err) {
+        this._host.innerHTML = `<div style="padding:12px;color:#a00">Viz error: ${esc(err && err.message ? err.message : String(err))}</div>`;
+        return done();
       }
     }
   });
