@@ -1,23 +1,24 @@
-(function() {
+(function(){
   looker.plugins.visualizations.add({
     id: "basic_test_chart",
     label: "Basic Test Chart",
     options: {},
-    create: function(element) {
-      element.innerHTML = "";
-      this._container = document.createElement("div");
-      this._container.style.width = "100%";
-      this._container.style.height = "100%";
-      element.appendChild(this._container);
+    create: function(el){
+      this._el = document.createElement("div");
+      this._el.style.cssText = "width:100%;height:100%;font:12px system-ui;padding:12px";
+      el.appendChild(this._el);
+      // Prove execution during create
+      this._el.innerHTML = "<div>create() ran</div>";
+      if (typeof console !== "undefined") console.log("basic_test create ran");
     },
-    updateAsync: function(data, element, config, queryResponse, details, done) {
-      // just render a rectangle as proof
-      this._container.innerHTML = `
-        <svg width="100%" height="200">
-          <rect x="50" y="20" width="50" height="160" fill="#007BFF" />
-          <text x="50" y="15" font-family="Arial" font-size="12">Test</text>
-        </svg>
-      `;
+    updateAsync: function(data, element, config, qr, details, done){
+      try {
+        // Prove execution during update
+        this._el.innerHTML += "<div>updateAsync() ran</div>";
+        this._el.innerHTML += `<pre style="white-space:pre-wrap">dims=${(qr.fields.dimensions||[]).length}, pivots=${(qr.fields.pivots||[]).length}, measures=${(qr.fields.measures||[]).length}</pre>`;
+      } catch(e){
+        this._el.innerHTML = '<div style="color:#a00">Viz error: '+ String(e) +'</div>';
+      }
       done();
     }
   });
